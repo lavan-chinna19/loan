@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../localization.dart';
 import '../api_service.dart';
 import 'login_screen.dart';
@@ -17,8 +19,11 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final _searchController = TextEditingController();
   List<dynamic> _borrowers = [];
+  Map<String, dynamic>? _dashboardStats;
   bool _isLoading = false;
   String? _errorMessage;
+
+  final currencyFormatter = NumberFormat.currency(locale: 'en_IN', symbol: '₹');
 
   @override
   void initState() {
@@ -40,8 +45,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final list = await ApiService.getBorrowers(query: query);
+      final stats = await ApiService.getDashboardStats();
       setState(() {
         _borrowers = list;
+        _dashboardStats = stats;
         _isLoading = false;
       });
     } catch (e) {
@@ -91,6 +98,80 @@ class _HomeScreenState extends State<HomeScreen> {
           builder: (context) => LoginScreen(languageNotifier: widget.languageNotifier),
         ),
       );
+    }
+  }
+
+  Future<void> _sendWhatsAppReminder(Map<String, dynamic> borrower, double _totalOutstanding) async {
+    final ln = widget.languageNotifier;
+    var phone = borrower['phone_number'].toString().replaceAll(RegExp(r'\D'), '');
+    if (phone.length == 10) phone = '91$phone';
+
+    final name = ln.isTelugu && borrower['name_te'] != null && borrower['name_te'].toString().trim().isNotEmpty
+        ? borrower['name_te']
+        : '${borrower['first_name_en']}';
+    final borrowerId = borrower['id'];
+    
+    // Calculate current monthly installment amount
+    double interestAmount = 0.0;
+    try {
+      final loans = await ApiService.getBorrowerLoans(borrowerId);
+      final nowStr = DateTime.now().toIso8601String().substring(0, 10);
+      for (var loan in loans) {
+        if (loan['status'] == 'ACTIVE' || loan['status'] == 'DEFAULTED') {
+          final details = await ApiService.getLoanDetails(loan['id']);
+          final schedules = details['schedules'] as List;
+          
+          bool foundFuture = false;
+          for (var sched in schedules) {
+            if (sched['status'] != 'PAID') {
+              final unpaid = double.parse(sched['total_due'].toString()) - double.parse(sched['amount_paid'].toString());
+              final dueDate = sched['due_date'].toString();
+              if (dueDate.compareTo(nowStr) <= 0) {
+                interestAmount += unpaid;
+              } else if (interestAmount == 0.0 && !foundFuture) {
+                interestAmount += unpaid;
+                foundFuture = true;
+              }
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    if (interestAmount <= 0) {
+      interestAmount = _totalOutstanding; // Fallback if no specific schedules are found but there's a balance
+    }
+
+    final formattedAmount = currencyFormatter.format(interestAmount);
+    
+    final String message = ln.isTelugu 
+        ? 'నమస్కారం $name గారు, మీ లోన్ ఖాతాకు సంబంధించి ఈ నెల వడ్డీ రూపాయిలు $formattedAmount చెల్లించవలసి ఉంది. దయచేసి వీలైనంత త్వరగా చెల్లించగలరు. ధన్యవాదాలు.'
+        : 'Hello $name, This is a friendly reminder that your monthly interest payment of $formattedAmount is currently due. Please arrange to pay at your earliest convenience. Thank you.';
+
+    final encodedMessage = Uri.encodeComponent(message);
+    final url = Uri.parse('whatsapp://send?phone=$phone&text=$encodedMessage');
+
+    try {
+      if (await canLaunchUrl(url)) {
+        await launchUrl(url);
+      } else {
+        // Fallback to web URL
+        final webUrl = Uri.parse('https://wa.me/$phone?text=$encodedMessage');
+        if (await canLaunchUrl(webUrl)) {
+          await launchUrl(webUrl, mode: LaunchMode.externalApplication);
+        } else {
+          throw Exception('Could not launch WhatsApp');
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(ln.isTelugu ? 'వాట్సాప్ ఓపెన్ చేయడం సాధ్యపడలేదు' : 'Could not launch WhatsApp'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
   }
 
@@ -168,6 +249,10 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
+            if (_dashboardStats != null) ...[
+              _buildDashboardMetricsCard(ln),
+              const SizedBox(height: 16),
+            ],
             
             // Search Input
             TextField(
@@ -219,32 +304,99 @@ class _HomeScreenState extends State<HomeScreen> {
                                     : 'No borrowers found',
                               ),
                             )
-                          : ListView.builder(
-                              itemCount: _borrowers.length,
-                              itemBuilder: (context, index) {
-                                final borrower = _borrowers[index];
-                                return Card(
-                                  margin: const EdgeInsets.only(bottom: 8),
-                                  child: ListTile(
-                                    title: Text(
-                                      '${borrower['first_name_en']} ${borrower['last_name_en']}',
-                                      style: const TextStyle(fontWeight: FontWeight.bold),
-                                    ),
-                                    subtitle: Text(borrower['phone_number']),
-                                    trailing: const Icon(Icons.chevron_right),
-                                    onTap: () {
-                                      Navigator.of(context).push(
-                                        MaterialPageRoute(
-                                          builder: (context) => BorrowerDetailScreen(
-                                            borrowerId: borrower['id'],
-                                            languageNotifier: widget.languageNotifier,
+                          : RefreshIndicator(
+                              onRefresh: () => _fetchBorrowers(_searchController.text.trim()),
+                              child: ListView.builder(
+                                itemCount: _borrowers.length,
+                                itemBuilder: (context, index) {
+                                  final borrower = _borrowers[index];
+                                  final hasLoan = borrower['has_loan'] == true;
+                                  final loanModel = borrower['latest_loan_model'] == 'MODEL_A' 
+                                      ? 'Model A' 
+                                      : borrower['latest_loan_model'] == 'MODEL_B' 
+                                          ? 'Model B' 
+                                          : null;
+                                  final outstanding = borrower['latest_outstanding'] as double? ?? 0.0;
+                                  final status = borrower['latest_loan_status']?.toString();
+
+                                  return Card(
+                                    margin: const EdgeInsets.only(bottom: 8),
+                                    child: ListTile(
+                                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                      title: Row(
+                                        children: [
+                                          Text(
+                                            '${borrower['first_name_en']} ${borrower['last_name_en']}',
+                                            style: const TextStyle(fontWeight: FontWeight.bold),
                                           ),
-                                        ),
-                                      ).then((_) => _fetchBorrowers(_searchController.text.trim()));
-                                    },
-                                  ),
-                                );
-                              },
+                                          const SizedBox(width: 8),
+                                          if (hasLoan && loanModel != null)
+                                            Container(
+                                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                                              decoration: BoxDecoration(
+                                                color: (status == 'ACTIVE' ? Colors.green : Colors.orange).withOpacity(0.15),
+                                                borderRadius: BorderRadius.circular(12),
+                                              ),
+                                              child: Text(
+                                                '$loanModel (${status ?? ''})',
+                                                style: TextStyle(
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: status == 'ACTIVE' ? Colors.green : Colors.orange,
+                                                ),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                      subtitle: Column(
+                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        children: [
+                                          const SizedBox(height: 4),
+                                          Text('${borrower['phone_number']} ${borrower['address_en'] != null ? '• ${borrower['address_en']}' : ''}'),
+                                          if (hasLoan && outstanding > 0)
+                                            Padding(
+                                              padding: const EdgeInsets.only(top: 4.0),
+                                              child: Text(
+                                                '${ln.isTelugu ? 'చెల్లించాల్సింది:' : 'Due:'} ${currencyFormatter.format(outstanding)}',
+                                                style: const TextStyle(color: Colors.orangeAccent, fontWeight: FontWeight.w600, fontSize: 13),
+                                              ),
+                                            ),
+                                          if (hasLoan && outstanding <= 0 && status == 'FULLY_PAID')
+                                            Padding(
+                                              padding: const EdgeInsets.only(top: 4.0),
+                                              child: Text(
+                                                ln.isTelugu ? 'పూర్తిగా చెల్లించబడింది' : 'Fully Paid',
+                                                style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold, fontSize: 12),
+                                              ),
+                                            ),
+                                        ],
+                                      ),
+                                      trailing: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          if (hasLoan && outstanding > 0)
+                                            IconButton(
+                                              icon: const Icon(Icons.wechat, color: Colors.green),
+                                              tooltip: ln.isTelugu ? 'వాట్సాప్ రిమైండర్' : 'WhatsApp Reminder',
+                                              onPressed: () => _sendWhatsAppReminder(borrower, outstanding),
+                                            ),
+                                          const Icon(Icons.chevron_right),
+                                        ],
+                                      ),
+                                      onTap: () {
+                                        Navigator.of(context).push(
+                                          MaterialPageRoute(
+                                            builder: (context) => BorrowerDetailScreen(
+                                              borrowerId: borrower['id'],
+                                              languageNotifier: widget.languageNotifier,
+                                            ),
+                                          ),
+                                        ).then((_) => _fetchBorrowers(_searchController.text.trim()));
+                                      },
+                                    ),
+                                  );
+                                },
+                              ),
                             ),
             ),
           ],
@@ -261,6 +413,71 @@ class _HomeScreenState extends State<HomeScreen> {
         tooltip: ln.translate('register_borrower'),
         child: const Icon(Icons.person_add_alt_1_rounded),
       ),
+    );
+  }
+
+  Widget _buildDashboardMetricsCard(LanguageNotifier ln) {
+    final stats = _dashboardStats!;
+    return Card(
+      color: Theme.of(context).colorScheme.primaryContainer.withOpacity(0.4),
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.analytics_outlined, color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: 8),
+                Text(
+                  ln.isTelugu ? 'రుణాల పోర్ట్‌ఫోలియో సారాంశం' : 'Portfolio Overview (Live Storage)',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                ),
+              ],
+            ),
+            const Divider(height: 24),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _buildStatItem(
+                  ln.isTelugu ? 'యాక్టివ్ రుణాలు' : 'Active Loans',
+                  '${stats['active_loans_count']}',
+                  Icons.real_estate_agent,
+                ),
+                _buildStatItem(
+                  ln.isTelugu ? 'వసూలైనది' : 'Total Collected',
+                  currencyFormatter.format(stats['total_collected']),
+                  Icons.check_circle_outline,
+                  color: Colors.green,
+                ),
+                _buildStatItem(
+                  ln.isTelugu ? 'బకాయిలు' : 'Outstanding',
+                  currencyFormatter.format(stats['total_outstanding']),
+                  Icons.pending_actions,
+                  color: stats['total_outstanding'] > 0 ? Colors.orange : Colors.grey,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildStatItem(String label, String value, IconData icon, {Color? color}) {
+    return Column(
+      children: [
+        Icon(icon, size: 20, color: color ?? Theme.of(context).colorScheme.secondary),
+        const SizedBox(height: 4),
+        Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: color)),
+        const SizedBox(height: 2),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+      ],
     );
   }
 }

@@ -15,6 +15,7 @@ class _RegisterBorrowerScreenState extends State<RegisterBorrowerScreen> {
   final _formKey = GlobalKey<FormState>();
   final _firstNameController = TextEditingController();
   final _lastNameController = TextEditingController();
+  final _teluguNameController = TextEditingController();
   final _phoneController = TextEditingController();
   final _altPhoneController = TextEditingController();
   final _addressController = TextEditingController();
@@ -25,6 +26,7 @@ class _RegisterBorrowerScreenState extends State<RegisterBorrowerScreen> {
   void dispose() {
     _firstNameController.dispose();
     _lastNameController.dispose();
+    _teluguNameController.dispose();
     _phoneController.dispose();
     _altPhoneController.dispose();
     _addressController.dispose();
@@ -44,6 +46,7 @@ class _RegisterBorrowerScreenState extends State<RegisterBorrowerScreen> {
     final data = {
       'first_name_en': _firstNameController.text.trim(),
       'last_name_en': _lastNameController.text.trim(),
+      'name_te': _teluguNameController.text.trim().isEmpty ? null : _teluguNameController.text.trim(),
       'phone_number': _phoneController.text.trim(),
       'alternative_phone': _altPhoneController.text.trim().isEmpty ? null : _altPhoneController.text.trim(),
       'address_en': _addressController.text.trim().isEmpty ? null : _addressController.text.trim(),
@@ -126,20 +129,32 @@ class _RegisterBorrowerScreenState extends State<RegisterBorrowerScreen> {
               ),
               const SizedBox(height: 16),
               
+              // Name in Telugu
+              TextFormField(
+                controller: _teluguNameController,
+                decoration: InputDecoration(
+                  labelText: ln.isTelugu ? 'తెలుగులో పేరు (ఐచ్ఛికం)' : 'Name in Telugu (Optional)',
+                  prefixIcon: const Icon(Icons.language),
+                ),
+              ),
+              const SizedBox(height: 16),
+              
               // Phone
               TextFormField(
                 controller: _phoneController,
+                maxLength: 10,
                 decoration: InputDecoration(
                   labelText: ln.translate('phone_number'),
                   prefixIcon: const Icon(Icons.phone),
+                  counterText: "",
                 ),
                 keyboardType: TextInputType.phone,
                 validator: (val) {
                   if (val == null || val.trim().isEmpty) {
                     return ln.isTelugu ? 'ఫోన్ నంబర్ తప్పనిసరి' : 'Phone number is required';
                   }
-                  if (val.trim().length < 10) {
-                    return ln.isTelugu ? 'సరైన ఫోన్ నంబర్ ఇవ్వండి' : 'Enter a valid 10-digit phone number';
+                  if (!RegExp(r'^[6-9]\d{9}$').hasMatch(val.trim())) {
+                    return ln.isTelugu ? 'సరైన 10-అంకెల భారతీయ మొబైల్ నంబర్ ఇవ్వండి (6-9 తో ప్రారంభమవ్వాలి)' : 'Enter a valid 10-digit Indian mobile number (starting with 6-9)';
                   }
                   return null;
                 },
@@ -149,11 +164,21 @@ class _RegisterBorrowerScreenState extends State<RegisterBorrowerScreen> {
               // Alt Phone
               TextFormField(
                 controller: _altPhoneController,
+                maxLength: 10,
                 decoration: InputDecoration(
                   labelText: ln.translate('alternative_phone'),
                   prefixIcon: const Icon(Icons.phone_iphone),
+                  counterText: "",
                 ),
                 keyboardType: TextInputType.phone,
+                validator: (val) {
+                  if (val != null && val.trim().isNotEmpty) {
+                    if (!RegExp(r'^[6-9]\d{9}$').hasMatch(val.trim())) {
+                      return ln.isTelugu ? 'సరైన 10-అంకెల భారతీయ మొబైల్ నంబర్ ఇవ్వండి (6-9 తో ప్రారంభమవ్వాలి)' : 'Enter a valid 10-digit Indian mobile number (starting with 6-9)';
+                    }
+                  }
+                  return null;
+                },
               ),
               const SizedBox(height: 16),
               

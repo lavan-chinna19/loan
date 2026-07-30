@@ -22,10 +22,41 @@ class ApiService {
     _userRole = prefs.getString('user_role');
     _userName = prefs.getString('user_name');
 
-    // Prepopulate database with mock data if empty
-    if (_borrowers.isEmpty) {
+    // Load persisted loans and borrowers from SharedPreferences
+    final borrowersJson = prefs.getString('saved_borrowers');
+    final loansJson = prefs.getString('saved_loans');
+    final schedulesJson = prefs.getString('saved_schedules');
+    final paymentsJson = prefs.getString('saved_payments');
+
+    if (borrowersJson != null && borrowersJson.isNotEmpty && borrowersJson != '[]') {
+      _borrowers.clear();
+      _loans.clear();
+      _schedules.clear();
+      _payments.clear();
+
+      _borrowers.addAll((jsonDecode(borrowersJson) as List).map((e) => Map<String, dynamic>.from(e)));
+      if (loansJson != null && loansJson.isNotEmpty) {
+        _loans.addAll((jsonDecode(loansJson) as List).map((e) => Map<String, dynamic>.from(e)));
+      }
+      if (schedulesJson != null && schedulesJson.isNotEmpty) {
+        _schedules.addAll((jsonDecode(schedulesJson) as List).map((e) => Map<String, dynamic>.from(e)));
+      }
+      if (paymentsJson != null && paymentsJson.isNotEmpty) {
+        _payments.addAll((jsonDecode(paymentsJson) as List).map((e) => Map<String, dynamic>.from(e)));
+      }
+    } else if (_borrowers.isEmpty) {
+      // Prepopulate database with sample mock borrowers and loans if storage is empty
       _prepopulateDatabase();
+      await _saveToPrefs();
     }
+  }
+
+  static Future<void> _saveToPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('saved_borrowers', jsonEncode(_borrowers));
+    await prefs.setString('saved_loans', jsonEncode(_loans));
+    await prefs.setString('saved_schedules', jsonEncode(_schedules));
+    await prefs.setString('saved_payments', jsonEncode(_payments));
   }
 
   static void _prepopulateDatabase() {
@@ -250,18 +281,76 @@ class ApiService {
     await prefs.remove('user_role');
   }
 
-  // Borrower CRUD
+  // Borrower CRUD & Dashboard Stats
+  static Future<Map<String, dynamic>> getDashboardStats() async {
+    await Future.delayed(const Duration(milliseconds: 100));
+    double totalPrincipal = 0.0;
+    int activeLoans = 0;
+
+    for (final l in _loans) {
+      if (l['status'] == 'ACTIVE' || l['status'] == 'FULLY_PAID' || l['status'] == 'DEFAULTED') {
+        totalPrincipal += double.parse(l['principal_amount'].toString());
+      }
+      if (l['status'] == 'ACTIVE' || l['status'] == 'PENDING') {
+        activeLoans++;
+      }
+    }
+    
+    double totalCollected = _payments.fold(0.0, (sum, p) => sum + double.parse(p['amount_paid'].toString()));
+    double totalDue = _schedules.fold(0.0, (sum, s) => sum + double.parse(s['total_due'].toString()));
+    double totalPaid = _schedules.fold(0.0, (sum, s) => sum + double.parse(s['amount_paid'].toString()));
+    double outstanding = totalDue - totalPaid;
+
+    return {
+      'total_borrowers': _borrowers.length,
+      'active_loans_count': activeLoans,
+      'total_principal': totalPrincipal,
+      'total_collected': totalCollected,
+      'total_outstanding': outstanding > 0 ? outstanding : 0.0,
+    };
+  }
+
   static Future<List<dynamic>> getBorrowers({String? query}) async {
     await Future.delayed(const Duration(milliseconds: 200));
-    if (query == null || query.isEmpty) {
-      return _borrowers;
+    List<Map<String, dynamic>> filtered = _borrowers;
+    if (query != null && query.isNotEmpty) {
+      final q = query.toLowerCase();
+      filtered = _borrowers.where((b) {
+        final firstName = b['first_name_en'].toString().toLowerCase();
+        final lastName = b['last_name_en'].toString().toLowerCase();
+        final phone = b['phone_number'].toString();
+        return firstName.contains(q) || lastName.contains(q) || phone.contains(q);
+      }).toList();
     }
-    final q = query.toLowerCase();
-    return _borrowers.where((b) {
-      final firstName = b['first_name_en'].toString().toLowerCase();
-      final lastName = b['last_name_en'].toString().toLowerCase();
-      final phone = b['phone_number'].toString();
-      return firstName.contains(q) || lastName.contains(q) || phone.contains(q);
+
+    return filtered.map((b) {
+      final bLoans = _loans.where((l) => l['borrower_id'] == b['id']).toList();
+      double totalLoanAmount = 0.0;
+      double totalOutstanding = 0.0;
+      String? activeLoanModel;
+      String? activeLoanStatus;
+
+      if (bLoans.isNotEmpty) {
+        final latestLoan = bLoans.last;
+        totalLoanAmount = double.parse(latestLoan['principal_amount'].toString());
+        activeLoanModel = latestLoan['interest_model'];
+        activeLoanStatus = latestLoan['status'];
+
+        final loanId = latestLoan['id'];
+        final bSchedules = _schedules.where((s) => s['loan_id'] == loanId).toList();
+        final due = bSchedules.fold(0.0, (sum, item) => sum + double.parse(item['total_due'].toString()));
+        final paid = bSchedules.fold(0.0, (sum, item) => sum + double.parse(item['amount_paid'].toString()));
+        totalOutstanding = due - paid;
+      }
+
+      return {
+        ...b,
+        'has_loan': bLoans.isNotEmpty,
+        'latest_loan_amount': totalLoanAmount,
+        'latest_outstanding': totalOutstanding > 0 ? totalOutstanding : 0.0,
+        'latest_loan_model': activeLoanModel,
+        'latest_loan_status': activeLoanStatus,
+      };
     }).toList();
   }
 
@@ -278,6 +367,7 @@ class ApiService {
       'id': newId,
       'first_name_en': data['first_name_en'],
       'last_name_en': data['last_name_en'],
+      'name_te': data['name_te'],
       'phone_number': phone,
       'alternative_phone': data['alternative_phone'],
       'address_en': data['address_en'],
@@ -286,6 +376,7 @@ class ApiService {
     };
     
     _borrowers.add(borrower);
+    await _saveToPrefs();
     return borrower;
   }
 
@@ -432,6 +523,7 @@ class ApiService {
 
     _loans.add(newLoan);
     _generateMockSchedules(loanId, principal, model, rate, tenure, DateTime.now());
+    await _saveToPrefs();
     
     return newLoan;
   }
@@ -461,6 +553,7 @@ class ApiService {
       loan['tenure_value'], 
       DateTime.now()
     );
+    await _saveToPrefs();
 
     return loan;
   }
@@ -535,6 +628,7 @@ class ApiService {
     };
 
     _payments.add(paymentRecord);
+    await _saveToPrefs();
     return paymentRecord;
   }
 
@@ -629,6 +723,9 @@ class ApiService {
       }
     }
 
+    if (rolledCount > 0) {
+      await _saveToPrefs();
+    }
     return rolledCount;
   }
 }

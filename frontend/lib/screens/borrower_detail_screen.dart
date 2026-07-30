@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:url_launcher/url_launcher.dart';
 import '../localization.dart';
 import '../api_service.dart';
 import 'create_loan_screen.dart';
@@ -105,6 +106,106 @@ class _BorrowerDetailScreenState extends State<BorrowerDetailScreen> {
     }
   }
 
+  Future<void> _markMonthAsPaid(String loanId, String scheduleId, double amount) async {
+    final ln = widget.languageNotifier;
+    try {
+      await ApiService.collectPayment({
+        'loan_id': loanId,
+        'payment_schedule_id': scheduleId,
+        'amount_paid': amount,
+        'payment_method': 'CASH',
+        'reference_no': '',
+        'remarks': 'Marked Paid from Schedule List',
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              ln.isTelugu ? 'చెల్లింపు విజయవంతంగా నమోదు చేయబడింది!' : 'Payment recorded successfully!',
+            ),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+      _fetchDetails();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(e.toString().replaceFirst('Exception: ', '')),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _sendWhatsAppReminder() async {
+    final ln = widget.languageNotifier;
+    
+    // Calculate total outstanding
+    double outstanding = 0.0;
+    for (var loan in _loans) {
+      if (loan['status'] == 'ACTIVE' || loan['status'] == 'DEFAULTED') {
+        try {
+          final details = await ApiService.getLoanDetails(loan['id']);
+          final schedules = details['schedules'] as List;
+          final due = schedules.fold(0.0, (sum, item) => sum + double.parse(item['total_due'].toString()));
+          final paid = schedules.fold(0.0, (sum, item) => sum + double.parse(item['amount_paid'].toString()));
+          outstanding += (due - paid);
+        } catch (_) {}
+      }
+    }
+
+    if (outstanding <= 0) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(ln.isTelugu ? 'బకాయిలు ఏవీ లేవు' : 'No outstanding amount due.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    var phone = _borrower!['phone_number'].toString().replaceAll(RegExp(r'\D'), '');
+    if (phone.length == 10) phone = '91$phone';
+
+    final name = ln.isTelugu && _borrower!['name_te'] != null && _borrower!['name_te'].toString().trim().isNotEmpty
+        ? _borrower!['name_te']
+        : '${_borrower!['first_name_en']}';
+    final formattedAmount = currencyFormatter.format(outstanding);
+    
+    final String message = ln.isTelugu 
+        ? 'నమస్కారం $name గారు, మీ లోన్ ఖాతాకు సంబంధించి ఈ నెల వడ్డీ రూపాయిలు $formattedAmount చెల్లించవలసి ఉంది. దయచేసి వీలైనంత త్వరగా చెల్లించగలరు. ధన్యవాదాలు.'
+        : 'Hello $name, This is a friendly reminder that your monthly interest payment of $formattedAmount is currently due. Please arrange to pay at your earliest convenience. Thank you.';
+
+    final encodedMessage = Uri.encodeComponent(message);
+    final url = Uri.parse('whatsapp://send?phone=$phone&text=$encodedMessage');
+
+    try {
+      if (await canLaunchUrl(url)) {
+        await launchUrl(url);
+      } else {
+        final webUrl = Uri.parse('https://wa.me/$phone?text=$encodedMessage');
+        if (await canLaunchUrl(webUrl)) {
+          await launchUrl(webUrl, mode: LaunchMode.externalApplication);
+        } else {
+          throw Exception('Could not launch WhatsApp');
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(ln.isTelugu ? 'వాట్సాప్ ఓపెన్ చేయడం సాధ్యపడలేదు' : 'Could not launch WhatsApp'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   Color _getStatusColor(String status) {
     switch (status) {
       case 'ACTIVE':
@@ -177,6 +278,11 @@ class _BorrowerDetailScreenState extends State<BorrowerDetailScreen> {
                       title: Text(ln.translate('phone_number')),
                       subtitle: Text(_borrower!['phone_number']),
                       contentPadding: EdgeInsets.zero,
+                      trailing: IconButton(
+                        icon: const Icon(Icons.wechat, color: Colors.green),
+                        tooltip: ln.isTelugu ? 'వాట్సాప్ రిమైండర్' : 'WhatsApp Reminder',
+                        onPressed: _sendWhatsAppReminder,
+                      ),
                     ),
                     if (_borrower!['alternative_phone'] != null)
                       ListTile(
@@ -308,7 +414,7 @@ class _BorrowerDetailScreenState extends State<BorrowerDetailScreen> {
                                       Expanded(flex: 2, child: Text(ln.translate('installment_no'), style: const TextStyle(fontWeight: FontWeight.bold))),
                                       Expanded(flex: 3, child: Text(ln.translate('due_date'), style: const TextStyle(fontWeight: FontWeight.bold))),
                                       Expanded(flex: 3, child: Text(ln.isTelugu ? 'బ్యాలెన్స్ (₹)' : 'Due (₹)', style: const TextStyle(fontWeight: FontWeight.bold), textAlign: TextAlign.right)),
-                                      Expanded(flex: 3, child: Text(ln.translate('status'), style: const TextStyle(fontWeight: FontWeight.bold), textAlign: TextAlign.right)),
+                                      Expanded(flex: 4, child: Text(ln.translate('status'), style: const TextStyle(fontWeight: FontWeight.bold), textAlign: TextAlign.right)),
                                     ],
                                   ),
                                 ),
@@ -353,25 +459,39 @@ class _BorrowerDetailScreenState extends State<BorrowerDetailScreen> {
                                               ),
                                             ),
                                             Expanded(
-                                              flex: 3, 
-                                              child: Text(
-                                                sStatus == 'ROLLED_OVER' 
-                                                    ? (ln.isTelugu ? 'రోల్‌ఓవర్' : 'ROLLED OVER') 
-                                                    : sStatus == 'PARTIALLY_PAID'
-                                                        ? (ln.isTelugu ? 'సగం చెల్లింపు' : 'PARTIAL')
-                                                        : sStatus == 'PAID'
-                                                            ? (ln.isTelugu ? 'చెల్లించబడింది' : 'PAID')
-                                                            : (ln.isTelugu ? 'గడువు ఉంది' : 'PENDING'),
-                                                textAlign: TextAlign.right,
-                                                style: TextStyle(
-                                                  color: sStatus == 'ROLLED_OVER' 
-                                                      ? Colors.red 
-                                                      : sStatus == 'PAID' 
-                                                          ? Colors.green 
-                                                          : Colors.orange,
-                                                  fontSize: 11,
-                                                  fontWeight: FontWeight.bold
-                                                ),
+                                              flex: 4, 
+                                              child: Row(
+                                                mainAxisAlignment: MainAxisAlignment.end,
+                                                children: [
+                                                  Text(
+                                                    sStatus == 'ROLLED_OVER' 
+                                                        ? (ln.isTelugu ? 'రోల్‌ఓవర్' : 'ROLLED OVER') 
+                                                        : sStatus == 'PARTIALLY_PAID'
+                                                            ? (ln.isTelugu ? 'సగం చెల్లింపు' : 'PARTIAL')
+                                                            : sStatus == 'PAID'
+                                                                ? (ln.isTelugu ? 'చెల్లించబడింది' : 'PAID')
+                                                                : (ln.isTelugu ? 'గడువు ఉంది' : 'PENDING'),
+                                                    textAlign: TextAlign.right,
+                                                    style: TextStyle(
+                                                      color: sStatus == 'ROLLED_OVER' 
+                                                          ? Colors.red 
+                                                          : sStatus == 'PAID' 
+                                                              ? Colors.green 
+                                                              : Colors.orange,
+                                                      fontSize: 10,
+                                                      fontWeight: FontWeight.bold
+                                                    ),
+                                                  ),
+                                                  if (sStatus != 'PAID' && sStatus != 'ROLLED_OVER')
+                                                    IconButton(
+                                                      icon: const Icon(Icons.check_circle_outline, size: 18),
+                                                      color: Colors.green,
+                                                      padding: const EdgeInsets.only(left: 4),
+                                                      constraints: const BoxConstraints(),
+                                                      tooltip: ln.isTelugu ? 'చెల్లించినట్లు గుర్తించండి' : 'Mark Month as Paid',
+                                                      onPressed: () => _markMonthAsPaid(loanId, sched['id'], outstanding),
+                                                    ),
+                                                ],
                                               ),
                                             ),
                                           ],
